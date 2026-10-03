@@ -672,7 +672,11 @@ pub fn test_nat_type() {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         crate::ipc::get_socks_ws();
         let is_direct = Config::get_socks().is_none() && !config::use_ws();
-        if !is_direct {
+        // 自建服务器 TLS 路径下 NAT test 必然失真（出口端口≠客户端源端口），
+        // 且 server2(端口-1) 无监听必然失败，重试只产生日志噪音，直接跳过
+        if !is_direct
+            || socket_client::is_self_hosted_target(&Config::get_rendezvous_server())
+        {
             Config::set_nat_type(NatType::SYMMETRIC as _);
             IS_RUNNING.store(false, Ordering::SeqCst);
             return;
