@@ -74,6 +74,10 @@ const ICE_DEDUP_WINDOW: usize = 256;
 const MAX_WEBRTC_ANSWERERS: usize = 16;
 static WEBRTC_ANSWERERS: AtomicUsize = AtomicUsize::new(0);
 
+/// UDP 注册持续失败后置位：本次进程内中介器循环改走 TCP 信令（TLS 长连注册）。
+/// start_tcp 也失败时清除，让 UDP 有机会重试（网络环境可能已变化）。
+static UDP_FALLBACK_TCP: AtomicBool = AtomicBool::new(false);
+
 /// One of the `MAX_WEBRTC_ANSWERERS` slots, given back on drop.
 struct AnswererSlot;
 
@@ -322,9 +326,13 @@ impl RendezvousMediator {
                             let err = format!("rendezvous mediator error: {err}");
                             // When user reboot, there might be below error, waiting too long
                             // (CONNECT_TIMEOUT 18s) will make user think there is bug
-                            if err.contains("10054") || err.contains("11001") {
+                            if err.contains("10054")
+                                || err.contains("11001")
+                                || err.contains("falling back to TCP")
+                            {
                                 // No such host is known. (os error 11001)
                                 // An existing connection was forcibly closed by the remote host. (os error 10054): also happens for UDP
+                                // UDP 封锁降级 TCP：尽快重启进入 TCP 注册
                                 *timeout.write().unwrap() = 3000;
                             }
                             log::error!("{err}");
@@ -457,6 +465,17 @@ impl RendezvousMediator {
                     if timeout || (last_register_sent.is_none() && expired) {
                         if timeout {
                             fails += 1;
+                            if fails >= MAX_FAILS2 * 5 {
+                                // 自建服务器注册超时无指数退避（3s 一次），连续 20 次（约
+                                // 一分钟）无响应即判定 UDP 被封锁，降级 TCP 信令
+                                log::warn!(
+                                    "UDP registration failed {} times on {}, falling back to TCP",
+                                    fails,
+                                    host
+                                );
+                                UDP_FALLBACK_TCP.store(true, Ordering::SeqCst);
+                                bail!("UDP registration blocked, falling back to TCP");
+                            }
                             if fails >= MAX_FAILS2 {
                                 Config::update_latency(&host, -1);
                                 old_latency = 0;
@@ -510,6 +529,9 @@ impl RendezvousMediator {
                         NEEDS_DEPLOY.store(false, Ordering::SeqCst);
                         #[cfg(target_os = "android")]
                         reset_needs_deploy_notification();
+                        // 密钥确认后立即注册：TCP 长连模式下让服务端尽快建立下行通道，
+                        // 免去等待下一个注册心跳周期
+                        self.register_peer(sink).await?;
                     }
                     Ok(register_pk_response::Result::UUID_MISMATCH) => {
                         self.handle_uuid_mismatch(sink).await?;
@@ -602,7 +624,11 @@ impl RendezvousMediator {
         log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
         let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
         let key = crate::get_key(true).await;
-        crate::secure_tcp(&mut conn, &key).await?;
+        // 自建 TLS 域名：传输层已是 TLS+SPKI 钉扎，且 OSS hbbs 不做 KeyExchange 握手，
+        // 等待只会白耗 READ_TIMEOUT，跳过应用层密钥交换
+        if !socket_client::is_self_hosted_target(&host) {
+            crate::secure_tcp(&mut conn, &key).await?;
+        }
         let mut rz = Self {
             addr: conn.local_addr().into_target_addr()?,
             host: host.clone(),
@@ -611,11 +637,17 @@ impl RendezvousMediator {
         };
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         let mut last_register_sent: Option<Instant> = None;
+        let mut last_register_resp: Option<Instant> = None;
         let mut last_recv_msg = Instant::now();
         // we won't support connecting to multiple rendzvous servers any more, so we can use a global variable here.
         Config::set_host_key_confirmed(&rz.host_prefix, false);
+        // TCP 注册：连接建立后立即发起注册（key 未确认时 register_peer 内部会先发
+        // register_pk），服务端据此把本连接纳入长连下行通道
+        rz.register_peer(Sink::Stream(&mut conn)).await?;
+        last_register_sent = Some(Instant::now());
         loop {
             let mut update_latency = || {
+                last_register_resp = Some(Instant::now());
                 let latency = last_register_sent
                     .map(|x| x.elapsed().as_micros() as i64)
                     .unwrap_or(0);
@@ -643,6 +675,15 @@ impl RendezvousMediator {
                     if last_recv_msg.elapsed().as_millis() as u64 > rz.keep_alive as u64 * 3 / 2 {
                         bail!("Rendezvous connection is timeout");
                     }
+                    // 注册心跳：REG_INTERVAL 内无注册响应则重发 RegisterPeer。
+                    // 服务端 30s 读超时与在线判定均依赖该心跳
+                    let expired = last_register_resp
+                        .map(|x| x.elapsed().as_millis() as i64 >= REG_INTERVAL)
+                        .unwrap_or(true);
+                    if expired {
+                        rz.register_peer(Sink::Stream(&mut conn)).await?;
+                        last_register_sent = Some(Instant::now());
+                    }
                     if (!Config::get_key_confirmed() ||
                         !Config::get_host_key_confirmed(&rz.host_prefix)) &&
                         last_register_sent.map(|x| x.elapsed().as_millis() as i64).unwrap_or(REG_INTERVAL) >= REG_INTERVAL {
@@ -664,6 +705,16 @@ impl RendezvousMediator {
             || crate::is_udp_disabled()
         {
             Self::start_tcp(server, host).await
+        } else if UDP_FALLBACK_TCP.load(Ordering::SeqCst) {
+            // UDP 被封锁的降级路径：改走 TCP 长连注册；TCP 也失败则清除标记回到 UDP 重试
+            match Self::start_tcp(server, host).await {
+                Err(err) => {
+                    log::warn!("TCP fallback failed, will retry UDP: {err}");
+                    UDP_FALLBACK_TCP.store(false, Ordering::SeqCst);
+                    Err(err)
+                }
+                ok => ok,
+            }
         } else {
             Self::start_udp(server, host).await
         }
