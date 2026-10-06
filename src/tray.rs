@@ -81,15 +81,16 @@ fn make_tray() -> hbb_common::ResultType<()> {
         tray_menu.append_items(&[&open_i]).ok();
     }
     let tooltip = |count: usize| {
+        // 青雲重制版：托盘提示带改版标识（不影响 with_id，其仍用原始 app name 小写）
         if count == 0 {
             format!(
-                "{} {}",
+                "{} 青雲重制版 {}",
                 crate::get_app_name(),
                 translate("Service is running".to_owned()),
             )
         } else {
             format!(
-                "{} - {}\n{}",
+                "{} 青雲重制版 - {}\n{}",
                 crate::get_app_name(),
                 translate("Ready".to_owned()),
                 translate("{".to_string() + &format!("{count}") + "} sessions"),

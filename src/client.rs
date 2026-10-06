@@ -5300,7 +5300,7 @@ pub mod peer_online {
         log,
         rendezvous_proto::*,
         sleep,
-        socket_client::connect_tcp,
+        socket_client::{connect_tcp, is_self_hosted_target},
         ResultType, Stream,
     };
 
@@ -5335,7 +5335,14 @@ pub mod peer_online {
         if port == 0 {
             bail!("Invalid server address: {}", rendezvous_server);
         }
-        let online_server = format!("{}:{}", tmp[0], port - 1);
+        // 青雲改造：自建 TLS 域名（rd-id.shryj.ltd:443）没有 port-1 在线查询监听，
+        // 改用同端口发 OnlineRequest，由服务端 handle_tcp 分支应答；
+        // 官方服务器仍走 port-1（21115）保持兼容。
+        let online_server = if is_self_hosted_target(&rendezvous_server) {
+            rendezvous_server.clone()
+        } else {
+            format!("{}:{}", tmp[0], port - 1)
+        };
         connect_tcp(online_server, CONNECT_TIMEOUT).await
     }
 

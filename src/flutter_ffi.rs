@@ -1118,11 +1118,13 @@ pub fn main_get_socks() -> Vec<String> {
 }
 
 pub fn main_get_app_name() -> String {
-    get_app_name()
+    // 青雲重制版：仅 UI 展示名（窗口标题/更新弹窗/打印机文案等）。
+    // 配置路径/IPC 管道/服务名仍用 get_app_name()（"RustDesk"），与既有部署兼容
+    format!("{} 青雲重制版", get_app_name())
 }
 
 pub fn main_get_app_name_sync() -> SyncReturn<String> {
-    SyncReturn(get_app_name())
+    SyncReturn(main_get_app_name())
 }
 
 pub fn main_uri_prefix_sync() -> SyncReturn<String> {

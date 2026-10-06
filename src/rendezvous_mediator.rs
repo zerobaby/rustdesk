@@ -76,7 +76,11 @@ static WEBRTC_ANSWERERS: AtomicUsize = AtomicUsize::new(0);
 
 /// UDP 注册持续失败后置位：本次进程内中介器循环改走 TCP 信令（TLS 长连注册）。
 /// start_tcp 也失败时清除，让 UDP 有机会重试（网络环境可能已变化）。
+/// 另：start_tcp 心跳循环内每 UDP_REPROBE_INTERVAL 秒做一次 TestNat 回探，
+/// UDP 恢复即切回 UDP 注册，重新获得打洞/P2P 直连能力（避免瞬态故障导致永久降级）。
 static UDP_FALLBACK_TCP: AtomicBool = AtomicBool::new(false);
+/// TCP 降级期间 UDP 回探间隔（秒）
+const UDP_REPROBE_INTERVAL: u64 = 300;
 
 /// One of the `MAX_WEBRTC_ANSWERERS` slots, given back on drop.
 struct AnswererSlot;
@@ -639,6 +643,7 @@ impl RendezvousMediator {
         let mut last_register_sent: Option<Instant> = None;
         let mut last_register_resp: Option<Instant> = None;
         let mut last_recv_msg = Instant::now();
+        let mut last_udp_probe: Option<Instant> = None;
         // we won't support connecting to multiple rendzvous servers any more, so we can use a global variable here.
         Config::set_host_key_confirmed(&rz.host_prefix, false);
         // TCP 注册：连接建立后立即发起注册（key 未确认时 register_peer 内部会先发
@@ -675,6 +680,22 @@ impl RendezvousMediator {
                     if last_recv_msg.elapsed().as_millis() as u64 > rz.keep_alive as u64 * 3 / 2 {
                         bail!("Rendezvous connection is timeout");
                     }
+                    // TCP 降级回探：UDP 被封常是瞬态的（如安装窗口/网络抖动），
+                    // 每 UDP_REPROBE_INTERVAL 秒发一次无状态 TestNat 探测，
+                    // 通了就退出 TCP 模式重新走 UDP 注册，恢复打洞/P2P 直连
+                    // （TCP 注册的设备会被服务端强制中继，RTT 约为直连 4 倍）。
+                    if UDP_FALLBACK_TCP.load(Ordering::SeqCst)
+                        && last_udp_probe
+                            .map(|t| t.elapsed().as_secs() >= UDP_REPROBE_INTERVAL)
+                            .unwrap_or(true)
+                    {
+                        last_udp_probe = Some(Instant::now());
+                        if Self::probe_udp_alive(&host).await {
+                            log::info!("UDP rendezvous reachable again, switching back to UDP mode");
+                            UDP_FALLBACK_TCP.store(false, Ordering::SeqCst);
+                            bail!("udp recovered");
+                        }
+                    }
                     // 注册心跳：REG_INTERVAL 内无注册响应则重发 RegisterPeer。
                     // 服务端 30s 读超时与在线判定均依赖该心跳
                     let expired = last_register_resp
@@ -694,6 +715,32 @@ impl RendezvousMediator {
             }
         }
         Ok(())
+    }
+
+    /// UDP 存活探测：向 rendezvous 服务器发 TestNatRequest，收到
+    /// TestNatResponse（服务端 handle_udp 无状态应答）即认为 UDP 链路可用。
+    /// 不触碰注册表，对正在进行的 TCP 注册零影响。
+    async fn probe_udp_alive(host: &str) -> bool {
+        let Ok((mut socket, addr)) = new_udp_for(host, CONNECT_TIMEOUT).await else {
+            return false;
+        };
+        let mut msg = Message::new();
+        msg.set_test_nat_request(TestNatRequest {
+            serial: 0,
+            ..Default::default()
+        });
+        if socket.send(&msg, addr).await.is_err() {
+            return false;
+        }
+        matches!(
+            socket.next_timeout(2_000).await,
+            Some(Ok((bytes, _))) if Message::parse_from_bytes(&bytes)
+                .map(|m| matches!(
+                    m.union,
+                    Some(rendezvous_message::Union::TestNatResponse(_))
+                ))
+                .unwrap_or(false)
+        )
     }
 
     pub async fn start(server: ServerPtr, host: String) -> ResultType<()> {
